@@ -8,7 +8,13 @@ Logging.disable_logging(Logging.Warn)
 
 ## Cell 2: Three-bus setup
 
-baseMVA = 100.0 # multiplier for the numbers shown, for example, 1.00 p.u. = 100 MW
+# UNITS: everything is in raw MW and raw dollars, no per-unit base.
+#   power     [MW]      flows, ratings, dispatch, load
+#   energy    [$/MWh]   gen_cost
+#   capital   [$/MW]    c_up
+#   bid caps  [$]       transmission_bids (a total, not a rate)
+# The susceptances b below stay as they are: PTDF depends only on their RATIOS,
+# so scaling them all by the same constant leaves the shift factors unchanged.
 
 # ---- bus -------------------------------------------------------------------
 bus = DataFrame(:bus => [1; 2; 3])
@@ -19,17 +25,17 @@ branch = DataFrame(
     fr_bus = [1, 1, 2],
     to_bus = [2, 3, 3],
     b = [-20.0, -10.0, -12.5], # susceptances
-    s = [0.40, 0.40, 0.30], # thermal flow limits
-    s_max_add = [10.0, 10.0, 10.0], # set very high so not binding. In case
+    s = [40.0, 40.0, 30.0], # thermal flow limits [MW]
+    s_max_add = [1000.0, 1000.0, 1000.0], # set very high so not binding. In case
     # we want to represent the range in which the constant c_up is assumed valid.
-    c_up = [0.010, 0.010, 0.005], # capital cost per p.u. of added capacity
+    c_up = [10.0, 10.0, 5.0], # capital cost per MW of added capacity [$/MW]
 )
 
 # ---- gen -------------------------------------------------------------------
 gen = DataFrame(
     bus  = [1, 2, 3],
-    pmin = [0.00, 0.00, 0.00],
-    pmax = [1.20, 0.80, 0.60],
+    pmin = [0.0, 0.0, 0.0],   # [MW]
+    pmax = [120.0, 80.0, 60.0], # [MW]
     is_new = [true, true, false], # G^new: the new generators bidding for transmission
 )
 
@@ -37,25 +43,25 @@ gen = DataFrame(
 # One row per load, NOT one row per bus (bus 1 simply has no load row).
 load = DataFrame(
     bus = [3],
-    pd  = [1.00]
+    pd  = [100.0] # [MW]
 )
 
 # ---- gen cost --------------------------------------------------------------
 # a 1D vector, one entry per generator, similar to in HW 1 setup
-# assumed constant marginal cost per p.u. for now (can put back in cost curves calcs later)
-gen_cost = [0.01, 0.02, 0.03]
+# assumed constant marginal cost for now (can put back in cost curves calcs later)
+gen_cost = [10.0, 20.0, 30.0] # [$/MWh]
 
 # ---- gen transmission bid --------------------------------------------------
-transmission_bids = [0.0023, 0.0002, 0.0] # transmission bid for each generator
-# MAX cost per p.u. of transmission each generator g is willing to pay
+transmission_bids = [230.0, 20.0, 0.0] # transmission bid for each generator [$]
+# MAX TOTAL dollars of transmission cost each generator g is willing to pay
 # TOY case. Used Claude to help come up with toy case. We have a low c_up
 # to make transmission be built in the base case. Gen 1 bid generous, gen 2 barely bids
 # sumT means lines are able to build
 # flowT means gen 2's bid binds, only a bit of upgrading is built
 
 println("branch susceptances b (negative, as in load_opf_data): ", round.(branch.b, digits = 3))
-println("total load = ", sum(load.pd), " p.u. = ", sum(load.pd) * baseMVA, " MW")
-println("total capacity = ", sum(gen.pmax), " p.u.")
+println("total load = ", sum(load.pd), " MW")
+println("total capacity = ", sum(gen.pmax), " MW")
 show(branch, summary = false); println()
 
 ## Cell 3: PTDF function
@@ -149,6 +155,13 @@ end
 # DFAX is a pure function of the network, so it can be built straight away.
 # S needs the baseline flows, so it is built in Cell 7 once `base` has been solved.
 DFAX = build_dfax(bus, branch)
+
+# print the DFAX matrix: rows are lines, columns are buses
+dfax_table = DataFrame(round.(DFAX, digits = 4), string.("bus_", bus.bus))
+insertcols!(dfax_table, 1,
+    :line => ["$(branch[l,:].fr_bus)->$(branch[l,:].to_bus)" for l in 1:size(branch, 1)])
+println("\nDFAX (rows = lines, cols = buses):")
+show(dfax_table, summary = false); println()
 
 
 ## Cell 6: transmission expansion (line upgrades) and DCOPF optimization model with constraints!
@@ -297,14 +310,14 @@ end
 
 # transmission-bid allocation toggle: :sumT = Cell 5A, bids must cover the total
 # upgrade cost in aggregate; :flowT = Cell 5B, cost split by share of line flow
-bid_constraint = :sumT
+bid_constraint = :flowT
 
 hours = 10.0
 ref_bus = 3 # only fixes the PTDF's angle datum; dispatch, flows and LMPs are invariant to it
 
 # baseline optimization in which no bids are submitted
 base, _, _, _ = solve_texp_DCOPF_ptdf(bus, gen, load, branch, gen_cost,
-                                      HiGHS.Optimizer; ref_bus = ref_bus, hours = hours,
+                                      Gurobi.Optimizer; ref_bus = ref_bus, hours = hours,
                                       allow_upgrades = false)
 
 # calculating fixed allocation shares from baseline flows
@@ -313,25 +326,24 @@ S, sigma, contrib = fixed_allocation_shares(base.flow, DFAX, gen)
 # DF_base = base.DF # what the system would build absent the entrants (useful later)
 
 texp, _, _, _ = solve_texp_DCOPF_ptdf(bus, gen, load, branch, gen_cost,
-                                      HiGHS.Optimizer; ref_bus = ref_bus, hours = hours,
+                                      Gurobi.Optimizer; ref_bus = ref_bus, hours = hours,
                                       allow_upgrades = true)
 
 println("\n==== baseline (no upgrades allowed) ====")
 println("total cost      = ", round(base.objective, digits = 6))
 println("dispatch PG     = ", round.(base.PG, digits = 4))
 println("flows           = ", round.(base.flow, digits = 4), "  (limits ", branch.s, ")")
-println("LMPs [\$/p.u.]   = ", round.(base.LMPs, digits = 5))
+println("LMPs [\$/MWh]    = ", round.(base.LMPs, digits = 5))
 
 println("\n==== with line upgrades ====")
 println("total cost      = ", round(texp.objective, digits = 6),
         "  (capital ", round(texp.capital_cost, digits = 6),
         " + operating ", round(texp.op_cost, digits = 6), ")")
 println("dispatch PG     = ", round.(texp.PG, digits = 4))
-println("capacity added  = ", round.(texp.DF, digits = 4), " p.u. = ",
-        round.(texp.DF .* baseMVA, digits = 2), " MW")
+println("capacity added  = ", round.(texp.DF, digits = 3), " MW")
 println("new ratings     = ", round.(texp.new_rating, digits = 4))
 println("flows           = ", round.(texp.flow, digits = 4))
-println("LMPs [\$/p.u.]   = ", round.(texp.LMPs, digits = 5))
+println("LMPs [\$/MWh]    = ", round.(texp.LMPs, digits = 5))
 println("net saving vs baseline = ", round(base.objective - texp.objective, digits = 6))
 
 
